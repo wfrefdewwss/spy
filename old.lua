@@ -1,26 +1,15 @@
 -- RemoteSpyLibrary.lua
--- Advanced Edition: Simple API, hidden power
+-- Enhanced Edition: Full origin tracing
 
 local RemoteSpyLibrary = {}
 RemoteSpyLibrary.__index = RemoteSpyLibrary
 
--- Default config
+-- Config
 local CONFIG = {
     MaxQueueSize = 500,
-    AutoClearCount = 1000,
     DefaultEnabled = true,
     CaptureReturnValues = true,
     EnableStats = true,
-    EnableExport = false,
-    Blocklist = {},
-    Allowlist = {},
-    FilterEvents = true,
-    FilterFunctions = true,
-    NameFilter = "",
-    ArgTypeFilter = nil, -- function to filter by arg types
-    Callback = nil,
-    ExportPlugin = nil,
-    OnBlock = nil, -- callback when remote is blocked
 }
 
 -- Internal state
@@ -28,12 +17,13 @@ local game_meta = getrawmetatable(game)
 local game_namecall = game_meta.__namecall
 local namecall_queue = {}
 local is_hooked = false
+local self_ref = nil
+local module_caller_script = nil
 local remote_stats = {}
 local call_history = {}
-local self_ref = nil
 
 -- =========================================
--- UTILITY FUNCTIONS (Now public)
+-- UTILITY FUNCTIONS (Public API)
 -- =========================================
 
 function RemoteSpyLibrary:GetPath(obj)
@@ -50,6 +40,30 @@ function RemoteSpyLibrary:GetPath(obj)
         path = path .. (part:match("^[%a_][%w_]*$") and "." .. part or "[\"" .. part:gsub('"', '\\"') .. "\"]")
     end
     return path
+end
+
+function RemoteSpyLibrary:GetScriptInfo(script)
+    if not script or typeof(script) ~= "Instance" or not script:IsA("LuaSourceContainer") then
+        return {
+            name = "Unknown",
+            path = "nil -- Not a script",
+            source = "N/A",
+            isModule = false,
+            isLocal = false,
+            isServer = false,
+            fullName = "N/A"
+        }
+    end
+    
+    return {
+        name = script.Name,
+        path = self:GetPath(script),
+        source = script:GetFullName(),
+        isModule = script:IsA("ModuleScript"),
+        isLocal = script:IsA("LocalScript"),
+        isServer = script:IsA("Script"),
+        fullName = script:GetFullName()
+    }
 end
 
 function RemoteSpyLibrary:GetType(val)
@@ -80,9 +94,23 @@ function RemoteSpyLibrary:TableToString(t, depth)
     return "{" .. table.concat(parts, ", ") .. "}"
 end
 
-function RemoteSpyLibrary:GenerateScript(obj, method, args)
+function RemoteSpyLibrary:GenerateScript(obj, method, args, callerInfo, moduleInfo)
     local path = self:GetPath(obj)
-    local script = "-- RemoteSpy Log\n-- Path: " .. path .. "\n-- Timestamp: " .. tick() .. "\n\n"
+    local script = "-- RemoteSpy Log\n"
+    script = script .. "-- Remote Path: " .. path .. "\n"
+    
+    if callerInfo then
+        script = script .. "-- Caller Script: " .. callerInfo.name .. "\n"
+        script = script .. "-- Caller Path: " .. callerInfo.path .. "\n"
+        script = script .. "-- Caller Type: " .. (callerInfo.isModule and "ModuleScript" or callerInfo.isLocal and "LocalScript" or "Script") .. "\n"
+    end
+    
+    if moduleInfo then
+        script = script .. "-- Module Script: " .. moduleInfo.name .. "\n"
+        script = script .. "-- Module Path: " .. moduleInfo.path .. "\n"
+    end
+    
+    script = script .. "-- Timestamp: " .. tick() .. "\n\n"
     
     for i, v in ipairs(args) do
         script = script .. "local Arg_" .. i .. " = " .. self:GetType(v) .. "\n"
@@ -93,186 +121,19 @@ function RemoteSpyLibrary:GenerateScript(obj, method, args)
     return script
 end
 
--- =========================================
--- STATISTICS TRACKING
--- =========================================
-
-function RemoteSpyLibrary:GetStats(remoteName)
-    if remoteName then
-        return remote_stats[remoteName] or {count = 0, lastCalled = 0, avgExecTime = 0}
+function RemoteSpyLibrary:GetModuleCaller()
+    if module_caller_script then
+        return self:GetScriptInfo(module_caller_script)
     end
-    return remote_stats
-end
-
-function RemoteSpyLibrary:ResetStats(remoteName)
-    if remoteName then
-        remote_stats[remoteName] = nil
-    else
-        remote_stats = {}
-    end
-end
-
-function RemoteSpyLibrary:GetTopRemotes(limit)
-    limit = limit or 10
-    local sorted = {}
-    for name, stats in pairs(remote_stats) do
-        table.insert(sorted, {name = name, count = stats.count, last = stats.lastCalled})
-    end
-    table.sort(sorted, function(a, b) return a.count > b.count end)
-    return {unpack(sorted, 1, limit)}
-end
-
--- =========================================
--- EXPORT PLUGINS
--- =========================================
-
-local ExportPlugins = {
-    clipboard = function(data)
-        local copy = Clipboard and Clipboard.set or Synapse and Synapse.Copy or setclipboard
-        if copy then copy(data.script) end
-    end,
-    
-    webhook = function(data, config)
-        local http = game:GetService("HttpService")
-        local payload = http:JSONEncode({
-            content = string.format("RemoteSpy Log: %s:%s", data.object.Name, data.method),
-            embeds = {{
-                title = data.object.Name,
-                description = "```lua\n" .. data.script .. "\n```",
-                color = data.object.ClassName == "RemoteEvent" and 65280 or 65535,
-                timestamp = DateTime.now():ToIsoDate(),
-                fields = {
-                    {name = "Path", value = data.path, inline = false},
-                    {name = "Caller", value = tostring(data.caller), inline = true}
-                }
-            }}
-        })
-        
-        syn.request({
-            Url = config.url,
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = payload
-        })
-    end,
-    
-    file = function(data, config)
-        if not writefile then return end
-        local filename = string.format("%s_%s_%d.lua", data.object.Name, data.method, tick())
-        writefile(filename, data.script)
-    end
-}
-
-function RemoteSpyLibrary:withExport(plugin, config)
-    if ExportPlugins[plugin] then
-        self.config.ExportPlugin = {name = plugin, func = ExportPlugins[plugin], config = config}
-    end
-    return self
-end
-
-function RemoteSpyLibrary:Export(data)
-    if self.config.ExportPlugin then
-        self.config.ExportPlugin.func(data, self.config.ExportPlugin.config)
-    end
-end
-
--- =========================================
--- BLOCKING & INTERCEPTION
--- =========================================
-
-function RemoteSpyLibrary:SetBlocklist(list)
-    self.config.Blocklist = list or {}
-    return self
-end
-
-function RemoteSpyLibrary:SetAllowlist(list)
-    self.config.Allowlist = list or {}
-    return self
-end
-
-function RemoteSpyLibrary:withBlocklist(...)
-    local list = type(...) == "table" and ... or {...}
-    return self:SetBlocklist(list)
-end
-
-function RemoteSpyLibrary:withAllowlist(...)
-    local list = type(...) == "table" and ... or {...}
-    return self:SetAllowlist(list)
-end
-
-function RemoteSpyLibrary:ShouldBlock(remote)
-    local name = remote.Name
-    
-    -- Allowlist takes precedence
-    if #self.config.Allowlist > 0 then
-        for _, allowed in ipairs(self.config.Allowlist) do
-            if name:match(allowed) then return false end
-        end
-        return true
-    end
-    
-    -- Check blocklist
-    for _, blocked in ipairs(self.config.Blocklist) do
-        if name:match(blocked) then return true end
-    end
-    
-    return false
-end
-
-function RemoteSpyLibrary:SetInterceptor(fn)
-    self.config.Interceptor = fn
-    return self
-end
-
--- =========================================
--- FLUENT API BUILDER
--- =========================================
-
-function RemoteSpyLibrary.new(opts)
-    opts = opts or {}
-    local self = setmetatable({}, RemoteSpyLibrary)
-    self.config = {
-        Enabled = opts.enabled ~= nil and opts.enabled or CONFIG.DefaultEnabled,
-        FilterEvents = opts.filterEvents ~= nil and opts.filterEvents or CONFIG.FilterEvents,
-        FilterFunctions = opts.filterFunctions ~= nil and opts.filterFunctions or CONFIG.FilterFunctions,
-        NameFilter = opts.nameFilter or CONFIG.NameFilter,
-        ArgTypeFilter = opts.argTypeFilter or CONFIG.ArgTypeFilter,
-        MaxQueueSize = opts.maxQueue or CONFIG.MaxQueueSize,
-        AutoClearCount = opts.autoClear or CONFIG.AutoClearCount,
-        CaptureReturnValues = opts.captureReturns ~= nil and opts.captureReturns or CONFIG.CaptureReturnValues,
-        EnableStats = opts.stats ~= nil and opts.stats or CONFIG.EnableStats,
-        Blocklist = {},
-        Allowlist = {},
-        Callback = nil,
-        ExportPlugin = nil,
-        Interceptor = nil,
-        OnBlock = nil,
+    return {
+        name = "Unknown",
+        path = "nil -- Could not determine",
+        source = "N/A",
+        isModule = false,
+        isLocal = false,
+        isServer = false,
+        fullName = "N/A"
     }
-    self_ref = self
-    return self
-end
-
-function RemoteSpyLibrary:withFilters(filters)
-    self.config.FilterEvents = filters.events
-    self.config.FilterFunctions = filters.functions
-    self.config.NameFilter = filters.names or ""
-    self.config.ArgTypeFilter = filters.argTypes
-    return self
-end
-
-function RemoteSpyLibrary:withAutoClear(count)
-    self.config.AutoClearCount = count
-    return self
-end
-
-function RemoteSpyLibrary:withStats(enabled)
-    self.config.EnableStats = enabled ~= nil and enabled or true
-    return self
-end
-
-function RemoteSpyLibrary:onRemote(callback)
-    self.config.Callback = callback
-    return self
 end
 
 -- =========================================
@@ -281,45 +142,29 @@ end
 
 local function processQueue()
     while #namecall_queue > 0 do
+        -- Check queue size limit
+        if #namecall_queue > CONFIG.MaxQueueSize then
+            table.remove(namecall_queue, 1)
+        end
+        
         local data = table.remove(namecall_queue, 1)
         local remote = data.object
         
-        -- Auto-cleanup history
-        if #call_history >= self_ref.config.AutoClearCount then
-            call_history = {unpack(call_history, -500)} -- Keep last 500
-        end
+        -- Get full script info
+        local callerInfo = self_ref:GetScriptInfo(data.caller)
+        local moduleInfo = self_ref:GetModuleCaller()
         
-        -- Check if blocked
-        if self_ref:ShouldBlock(remote) then
-            if self_ref.config.OnBlock then
-                self_ref.config.OnBlock(data)
-            end
-            return -- Block the call
-        end
-        
-        -- Apply name filter
-        if self_ref.config.NameFilter ~= "" and not remote.Name:lower():find(self_ref.config.NameFilter:lower(), 1, true) then
-            return
-        end
-        
-        -- Apply arg type filter
-        if self_ref.config.ArgTypeFilter then
-            local match = false
-            for _, arg in ipairs(data.args) do
-                if self_ref.config.ArgTypeFilter(typeof(arg)) then match = true end
-            end
-            if not match then return end
-        end
+        -- Generate enhanced script
+        data.script = self_ref:GenerateScript(remote, data.method, data.args, callerInfo, moduleInfo)
+        data.callerInfo = callerInfo
+        data.moduleCaller = moduleInfo
+        data.path = self_ref:GetPath(remote)
         
         -- Update stats
-        if self_ref.config.EnableStats then
-            remote_stats[remote.Name] = remote_stats[remote.Name] or {count = 0, lastCalled = 0, execTimes = {}}
-            local stats = remote_stats[remote.Name]
-            stats.count = stats.count + 1
-            stats.lastCalled = tick()
-            stats.execTimes[#stats.execTimes + 1] = tick() - data.timestamp
-            if #stats.execTimes > 100 then table.remove(stats.execTimes, 1) end
-            stats.avgExecTime = stats.execTimes[#stats.execTimes] -- Simplified
+        if CONFIG.EnableStats then
+            remote_stats[remote.Name] = remote_stats[remote.Name] or {count = 0, lastCalled = 0}
+            remote_stats[remote.Name].count = remote_stats[remote.Name].count + 1
+            remote_stats[remote.Name].lastCalled = tick()
         end
         
         -- Store in history
@@ -327,44 +172,37 @@ local function processQueue()
         
         -- User callback
         if self_ref.config.Callback then
-            data.path = self_ref:GetPath(remote)
             pcall(self_ref.config.Callback, data)
-        end
-        
-        -- Export if enabled
-        if self_ref.config.ExportPlugin then
-            pcall(self_ref.Export, self_ref, data)
         end
     end
 end
 
--- Hook
+-- Hook function
 local function onNamecall(obj, ...)
     local method = getnamecallmethod()
     local args = {...}
     local timestamp = tick()
     
-    -- Intercept if configured
-    if self_ref.config.Interceptor then
-        local modifiedArgs, shouldBlock = self_ref.config.Interceptor(obj, method, args)
-        if shouldBlock then return end
-        args = modifiedArgs or args
-    end
-    
     if obj.Name ~= "CharacterSoundEvent" and method:match("Server") and self_ref.config.Enabled then
         local returnValue = nil
+        
+        -- Capture return values for RemoteFunctions
         if obj.ClassName == "RemoteFunction" and method == "InvokeServer" and self_ref.config.CaptureReturnValues then
             local success, result = pcall(function() return obj:InvokeServer(unpack(args)) end)
             if success then returnValue = result end
         end
         
+        -- Get calling environment
+        local caller = getfenv(2).script
+        
+        -- Queue for processing
         table.insert(namecall_queue, {
             object = obj,
             method = method,
             args = args,
             returnValue = returnValue,
             timestamp = timestamp,
-            caller = getfenv(2).script
+            caller = caller -- Store the script that fired this
         })
     end
     
@@ -372,8 +210,25 @@ local function onNamecall(obj, ...)
 end
 
 -- =========================================
--- CONTROL METHODS
+-- PUBLIC API
 -- =========================================
+
+function RemoteSpyLibrary.new(opts)
+    opts = opts or {}
+    local self = setmetatable({}, RemoteSpyLibrary)
+    self.config = {
+        Enabled = opts.enabled ~= nil and opts.enabled or CONFIG.DefaultEnabled,
+        CaptureReturnValues = opts.captureReturns ~= nil and opts.captureReturns or CONFIG.CaptureReturnValues,
+        Callback = nil,
+    }
+    self_ref = self
+    
+    -- Capture the script that required this module
+    module_caller_script = getfenv(2).script
+    self.moduleCallerInfo = self:GetScriptInfo(module_caller_script)
+    
+    return self
+end
 
 function RemoteSpyLibrary:Start()
     if is_hooked then return self end
@@ -411,6 +266,19 @@ function RemoteSpyLibrary:SetEnabled(enabled)
     return self
 end
 
+function RemoteSpyLibrary:onRemote(callback)
+    self.config.Callback = callback
+    return self
+end
+
+-- =========================================
+-- ADDITIONAL UTILITY METHODS
+-- =========================================
+
+function RemoteSpyLibrary:GetModuleInfo()
+    return self.moduleCallerInfo
+end
+
 function RemoteSpyLibrary:ClearHistory()
     call_history = {}
     remote_stats = {}
@@ -419,11 +287,23 @@ end
 
 function RemoteSpyLibrary:GetHistory(limit)
     limit = limit or 100
-    return {unpack(call_history, -limit)}
+    local startIdx = math.max(1, #call_history - limit + 1)
+    local result = {}
+    for i = startIdx, #call_history do
+        table.insert(result, call_history[i])
+    end
+    return result
+end
+
+function RemoteSpyLibrary:GetStats(remoteName)
+    if remoteName then
+        return remote_stats[remoteName] or {count = 0, lastCalled = 0}
+    end
+    return remote_stats
 end
 
 -- =========================================
--- EXPORT
+-- RETURN MODULE
 -- =========================================
 
 return RemoteSpyLibrary
